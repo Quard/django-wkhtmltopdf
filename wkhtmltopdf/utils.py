@@ -66,6 +66,11 @@ def _options_to_args(**options):
         flags.append(formatted_flag)
         if accepts_no_arguments:
             continue
+        if isinstance(value, list):
+            # wkhtmltopdf can accept many parameters like --cookie
+            for item in value:
+                flags.extend(_options_to_args(**{name: item}))
+            continue
         flags.append(six.text_type(value))
     return flags
 
@@ -135,7 +140,7 @@ def wkhtmltopdf(pages, output=None, **kwargs):
                          _options_to_args(**options),
                          list(pages),
                          [output]))
-    ck_kwargs = {'env': env}
+    ck_kwargs = {'env': env, 'shell': True}
     # Handling of fileno() attr. based on https://github.com/GrahamDumpleton/mod_wsgi/issues/85
     try:
         i = sys.stderr.fileno()
@@ -144,7 +149,7 @@ def wkhtmltopdf(pages, output=None, **kwargs):
         # can't call fileno() on mod_wsgi stderr object
         pass
 
-    return check_output(ck_args, **ck_kwargs)
+    return check_output([' '.join(ck_args)], **ck_kwargs)
 
 def convert_to_pdf(filename, header_filename=None, footer_filename=None, cmd_options=None, cover_filename=None):
     # Clobber header_html and footer_html only if filenames are
