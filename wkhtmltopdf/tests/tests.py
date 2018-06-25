@@ -6,14 +6,17 @@ import os
 import sys
 
 from django.conf import settings
+from django.template import loader, RequestContext
 from django.test import TestCase
+from django.test.utils import override_settings
 from django.test.client import RequestFactory
 from django.utils import six
 from django.utils.encoding import smart_str
 
 from wkhtmltopdf.subprocess import CalledProcessError
 from wkhtmltopdf.utils import (_options_to_args, make_absolute_paths,
-    wkhtmltopdf)
+                               wkhtmltopdf, render_pdf_from_template,
+                               render_to_temporary_file, RenderedFile)
 from wkhtmltopdf.views import PDFResponse, PDFTemplateView, PDFTemplateResponse
 
 
@@ -28,6 +31,7 @@ class UnicodeContentPDFTemplateView(PDFTemplateView):
         context = Base.get_context_data(**kwargs)
         context['title'] = u'♥'
         return context
+
 
 class TestUtils(TestCase):
     def setUp(self):
@@ -46,14 +50,21 @@ class TestUtils(TestCase):
                          ['--file-name', 'file-name',
                           '--heart', u'♥',
                           '--verbose'])
+        self.assertEqual(_options_to_args(heart=u'♥', quiet=True,
+                                          file_name='file-name'),
+                         ['--file-name', 'file-name',
+                          '--heart', u'♥',
+                          '--quiet'])
+        self.assertEqual(_options_to_args(heart=u'♥', quiet=False,
+                                          file_name='file-name'),
+                         ['--file-name', 'file-name',
+                          '--heart', u'♥'])
 
     def test_wkhtmltopdf(self):
         """Should run wkhtmltopdf to generate a PDF"""
         title = 'A test template.'
-        response = PDFTemplateResponse(self.factory.get('/'),
-                                       None,
-                                       context={'title': title})
-        temp_file = response.render_to_temporary_file('sample.html')
+        template = loader.get_template('sample.html')
+        temp_file = render_to_temporary_file(template, context={'title': title})
         try:
             # Standard call
             pdf_output = wkhtmltopdf(pages=[temp_file.name])
@@ -76,31 +87,80 @@ class TestUtils(TestCase):
     def test_wkhtmltopdf_with_unicode_content(self):
         """A wkhtmltopdf call should render unicode content properly"""
         title = u'♥'
-        response = PDFTemplateResponse(self.factory.get('/'),
-                                       None,
-                                       context={'title': title})
-        temp_file = response.render_to_temporary_file('unicode.html')
+        template = loader.get_template('unicode.html')
+        temp_file = render_to_temporary_file(template, context={'title': title})
         try:
             pdf_output = wkhtmltopdf(pages=[temp_file.name])
             self.assertTrue(pdf_output.startswith(b'%PDF'), pdf_output)
         finally:
             temp_file.close()
 
-    def test_PDFTemplateResponse_render_to_temporary_file(self):
+    def test_render_to_temporary_file(self):
         """Should render a template to a temporary file."""
         title = 'A test template.'
-        response = PDFTemplateResponse(self.factory.get('/'),
-                                       None,
-                                       context={'title': title})
-        temp_file = response.render_to_temporary_file('sample.html')
+
+        template = loader.get_template('sample.html')
+        temp_file = render_to_temporary_file(template, context={'title': title})
         temp_file.seek(0)
         saved_content = smart_str(temp_file.read())
         self.assertTrue(title in saved_content)
         temp_file.close()
 
+    def _render_file(self, template, context):
+        """Helper method for testing rendered file deleted/persists tests."""
+        render = RenderedFile(template=template, context=context)
+        render.temporary_file.seek(0)
+        saved_content = smart_str(render.temporary_file.read())
+
+        return (saved_content, render.filename)
+
+    def test_rendered_file_deleted_on_production(self):
+        """If WKHTMLTOPDF_DEBUG=False, delete rendered file on object close."""
+        title = 'A test template.'
+        template = loader.get_template('sample.html')
+        debug = getattr(settings, 'WKHTMLTOPDF_DEBUG', settings.DEBUG)
+
+        saved_content, filename = self._render_file(template=template,
+                                                    context={'title': title})
+        # First verify temp file was rendered correctly.
+        self.assertTrue(title in saved_content)
+
+        # Then check if file is deleted when debug=False.
+        self.assertFalse(debug)
+        self.assertFalse(os.path.isfile(filename))
+
+    def test_rendered_file_persists_on_debug(self):
+        """If WKHTMLTOPDF_DEBUG=True, the rendered file should persist."""
+        title = 'A test template.'
+        template = loader.get_template('sample.html')
+        with self.settings(WKHTMLTOPDF_DEBUG=True):
+            debug = getattr(settings, 'WKHTMLTOPDF_DEBUG', settings.DEBUG)
+
+            saved_content, filename = self._render_file(template=template,
+                                                    context={'title': title})
+            # First verify temp file was rendered correctly.
+            self.assertTrue(title in saved_content)
+
+            # Then check if file persists when debug=True.
+            self.assertTrue(debug)
+            self.assertTrue(os.path.isfile(filename))
+
+    def test_render_with_null_request(self):
+        """If request=None, the file should render properly."""
+        title = 'A test template.'
+        template = loader.get_template('sample.html')
+        pdf_content = render_pdf_from_template('sample.html',
+                                               header_template=None,
+                                               footer_template=None,
+                                               context={'title': title})
+
+        self.assertTrue(pdf_content.startswith(b'%PDF-'))
+        self.assertTrue(pdf_content.endswith(b'%%EOF\n'))
+
 
 class TestViews(TestCase):
     template = 'sample.html'
+    context_template = 'context.html'
     footer_template = 'footer.html'
     pdf_filename = 'output.pdf'
     attached_fileheader = 'attachment; filename="{0}"'
@@ -134,8 +194,14 @@ class TestViews(TestCase):
         self.assertEqual(response['Content-Disposition'],
                          'attachment; filename="4\'5.pdf"')
         response = PDFResponse(content=content, filename=u"♥.pdf")
+        try:
+            import unidecode
+        except ImportError:
+            filename = '?.pdf'
+        else:
+            filename = '.pdf'
         self.assertEqual(response['Content-Disposition'],
-                         'attachment; filename="?.pdf"')
+                         'attachment; filename="{0}"'.format(filename))
 
         # Content as a direct output
         response = PDFResponse(content=content, filename="nospace.pdf",
@@ -152,8 +218,14 @@ class TestViews(TestCase):
                          'inline; filename="4\'5.pdf"')
         response = PDFResponse(content=content, filename=u"♥.pdf",
             show_content_in_browser=True)
+        try:
+            import unidecode
+        except ImportError:
+            filename = '?.pdf'
+        else:
+            filename = '.pdf'
         self.assertEqual(response['Content-Disposition'],
-                         'inline; filename="?.pdf"')
+                         'inline; filename="{0}"'.format(filename))
 
         # Content-Type
         response = PDFResponse(content=content,
@@ -179,7 +251,8 @@ class TestViews(TestCase):
         self.assertFalse(response.has_header('Content-Disposition'))
 
         # Render to temporary file
-        tempfile = response.render_to_temporary_file(self.template)
+        template = loader.get_template(self.template)
+        tempfile = render_to_temporary_file(template, context=context)
         tempfile.seek(0)
         html_content = smart_str(tempfile.read())
         self.assertTrue(html_content.startswith('<html>'))
@@ -205,7 +278,9 @@ class TestViews(TestCase):
         self.assertEqual(response.cmd_options, cmd_options)
         self.assertTrue(response.has_header('Content-Disposition'))
 
-        tempfile = response.render_to_temporary_file(self.footer_template)
+        footer_template = loader.get_template(self.footer_template)
+        tempfile = render_to_temporary_file(footer_template, context=context,
+                                            request=request)
         tempfile.seek(0)
         footer_content = smart_str(tempfile.read())
         footer_content = make_absolute_paths(footer_content)
@@ -306,3 +381,60 @@ class TestViews(TestCase):
         view.cmd_options.update(cmd_options)
         self.assertEqual(view.cmd_options, cmd_options)
         self.assertEqual(PDFTemplateView.cmd_options, {})
+
+    def _render_file(self, template, context, request=None):
+        """Helper method for testing rendered file deleted/persists tests."""
+        render = RenderedFile(template=template, context=context, request=request)
+        render.temporary_file.seek(0)
+        saved_content = smart_str(render.temporary_file.read())
+
+        return (saved_content, render.filename)
+
+    @override_settings(
+        DEBUG=True,
+        INTERNAL_IPS=['127.0.0.1'],
+        TEMPLATES=[
+            {
+                'BACKEND': 'django.template.backends.django.DjangoTemplates',
+                'APP_DIRS': True,
+                'OPTIONS': {
+                    'context_processors': [
+                        'django.template.context_processors.debug',
+                    ],
+                },
+            },
+        ]
+    )
+    def test_get_context_processor_variables_debug(self, show_content=False):
+        request = RequestFactory().get('/')
+        template = loader.get_template(self.context_template)
+
+        saved_content, filename = self._render_file(template=template, context={}, request=request)
+        self.assertTrue('<h1>True</h1>' in saved_content)
+
+        with override_settings(DEBUG=False):
+            request = RequestFactory().get('/')
+            template = loader.get_template(self.context_template)
+
+            saved_content, filename = self._render_file(template=template, context={}, request=request)
+            self.assertTrue('<h1></h1>' in saved_content)
+
+        view = PDFTemplateView.as_view(filename=self.pdf_filename,
+                                       show_content_in_browser=show_content,
+                                       template_name=self.context_template,
+                                       footer_template=self.footer_template)
+        # As HTML
+        request = RequestFactory().get('/?as=html')
+        response = view(request)
+        self.assertEqual(response.status_code, 200)
+        response.render()
+        self.assertIn(b'<h1>True</h1>', response.content)
+        with override_settings(DEBUG=False):
+            request = RequestFactory().get('/?as=html')
+            response = view(request)
+            self.assertEqual(response.status_code, 200)
+            response.render()
+            self.assertIn(b'<h1></h1>', response.content)
+
+    def test_get_context_processor_variables_debug_show_content(self):
+        self.test_get_context_processor_variables_debug(show_content=True)
