@@ -149,7 +149,7 @@ def wkhtmltopdf(pages, output=None, **kwargs):
         # can't call fileno() on mod_wsgi stderr object
         pass
 
-    return check_output([' '.join(ck_args)], **ck_kwargs)
+    return check_output(ck_args, **ck_kwargs)
 
 def convert_to_pdf(filename, header_filename=None, footer_filename=None, cmd_options=None, cover_filename=None):
     # Clobber header_html and footer_html only if filenames are
